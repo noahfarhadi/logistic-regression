@@ -80,6 +80,8 @@ CONFIG = {
 TRANSFORMS = ["None", "Log", "Square root", "Yeo-Johnson"]
 TRANSFORM_TAGS = {"None": "", "Log": "log", "Square root": "sqrt", "Yeo-Johnson": "YJ"}
 MISSING_RULES = ["Drop rows with missing values", "Fill gaps (median for numbers, most frequent for text)"]
+EVENT_OPS = {"is at least": ">=", "is above": ">", "is at most": "<=", "is below": "<"}
+OP_SYMBOLS = {">=": "\u2265", ">": ">", "<=": "\u2264", "<": "<"}
 SE_LABELS = {False: "classical standard errors", True: "robust (HC0) standard errors"}
 
 # ---------------------------------------------------------------------------
@@ -287,8 +289,26 @@ def is_numeric(s):
     return pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s)
 
 
-def target_candidates(df):
-    return [c for c in df.columns if df[c].dropna().nunique() == 2]
+def dependent_candidates(df):
+    """Any column with at least two distinct values can be the dependent variable (dates excluded)."""
+    return [c for c in df.columns if not pd.api.types.is_datetime64_any_dtype(df[c]) and df[c].dropna().nunique() >= 2]
+
+
+def encode_event(s, event):
+    """Turn a column into 0/1. event is {"mode": "values", "values": [...]} (1 when the value is in the list)
+    or {"mode": "threshold", "op": ">=", "value": x} (1 when the comparison holds)."""
+    if event["mode"] == "values":
+        return s.isin(event["values"]).astype(int)
+    v = event["value"]
+    test = {">=": s >= v, ">": s > v, "<=": s <= v, "<": s < v}[event["op"]]
+    return test.astype(int)
+
+
+def event_text(target, event):
+    if event["mode"] == "values":
+        vals = ", ".join(label_text(v) for v in event["values"])
+        return f"{target} = {vals}" if len(event["values"]) == 1 else f"{target} in ({vals})"
+    return f"{target} {OP_SYMBOLS[event['op']]} {event['value']:g}"
 
 
 def feature_candidates(df, target):
@@ -324,7 +344,7 @@ def column_overview(df):
 # ---------------------------------------------------------------------------
 # 5. Building the design matrix
 # ---------------------------------------------------------------------------
-def build_design(df, target, positive, features, missing_rule):
+def build_design(df, target, event, features, missing_rule):
     """Return a dict with y (0/1), X (all predictors as numbers), the names of the continuous and the
     0/1 predictors, and a list of notes about what was done (rows dropped, dummies created)."""
     notes = []
@@ -340,7 +360,7 @@ def build_design(df, target, positive, features, missing_rule):
     data = data.reset_index(drop=True)
     if n_raw - len(data) > 0:
         notes.append(f"{n_raw - len(data):,} of {n_raw:,} rows were removed because of missing values.")
-    y = (data[target] == positive).astype(int)
+    y = encode_event(data[target], event)
 
     parts, continuous, binary = [], [], []
     for c in features:
@@ -692,8 +712,8 @@ def header():
 
 
 def welcome():
-    steps = [("1", "Upload", "A CSV or Excel file with one row per observation and a column that has exactly two values."),
-             ("2", "Choose variables", "Pick the dependent variable and the event, then the independent variables."),
+    steps = [("1", "Upload", "A CSV or Excel file with one row per observation."),
+             ("2", "Choose variables", "Pick any dependent variable and define the event: a value, several values or a threshold. Then pick the independent variables."),
              ("3", "Prepare", "Standardize, reduce skewness and choose standard errors that allow for heteroskedasticity."),
              ("4", "Validate", "Set the share of data kept for testing and the classification threshold.")]
     cards = "".join(f'<div class="lg-card"><div class="lg-ch">{n}. {esc(t)}</div><div class="lg-cap">{esc(d)}</div></div>'
@@ -732,6 +752,35 @@ def confusion_html(m):
 # ---------------------------------------------------------------------------
 # 10. The application
 # ---------------------------------------------------------------------------
+def choose_event(df, target, key):
+    """Widgets that define the event (coded 1) for the chosen dependent variable. Returns the event, or None
+    while the choice is incomplete."""
+    col = df[target].dropna()
+    n = col.nunique()
+    numeric = is_numeric(col) and not pd.api.types.is_bool_dtype(col)
+    levels = sorted(col.unique().tolist(), key=str)
+    k = lambda name: key(f"{name}::{target}")
+    if n == 2:
+        default = levels.index(1) if 1 in levels else len(levels) - 1
+        one = st.selectbox("Event coded as 1", levels, index=default, key=k("event_one"), format_func=label_text)
+        return {"mode": "values", "values": [one]}
+    modes = (["Selected values"] if n <= CONFIG["max_dummy_levels"] else []) + (["Threshold"] if numeric else [])
+    if not modes:
+        st.warning(f"{target} has {n:,} distinct text values. Choose a column with at most "
+                   f"{CONFIG['max_dummy_levels']} distinct values, or a number column.")
+        return None
+    mode = modes[0] if len(modes) == 1 else st.radio("Define the event by", modes, horizontal=True, key=k("event_mode"))
+    if mode == "Selected values":
+        chosen = st.multiselect("Values coded as 1", levels, key=k("event_vals"), format_func=label_text,
+                                placeholder="Choose one or more values")
+        st.markdown('<div class="lg lg-cap">All other values are coded 0.</div>', unsafe_allow_html=True)
+        return {"mode": "values", "values": chosen} if 0 < len(chosen) < n else None
+    op = st.selectbox("Event coded as 1 when the value", list(EVENT_OPS), key=k("event_op"))
+    value = st.number_input("Threshold", value=float(col.median()), format="%g", key=k("event_thr"))
+    st.markdown('<div class="lg lg-cap">All other rows are coded 0.</div>', unsafe_allow_html=True)
+    return {"mode": "threshold", "op": EVENT_OPS[op], "value": float(value)}
+
+
 def main():
     st.set_page_config(page_title=CONFIG["page_title"], layout="wide", initial_sidebar_state="expanded")
     inject_css()
@@ -764,23 +813,20 @@ def main():
     if df.shape[0] < CONFIG["min_rows"] or df.shape[1] < 2:
         st.error(f"The file needs at least {CONFIG['min_rows']} rows and two columns.")
         return
-    candidates = target_candidates(df)
+    candidates = dependent_candidates(df)
     if not candidates:
-        st.error("No column has exactly two distinct values, so there is no possible dependent variable. "
-                 "Logistic regression needs a two-valued outcome.")
+        st.error("No column has at least two distinct values, so there is no possible dependent variable.")
         return
 
     # Steps 2 to 4 in the sidebar: variables, preparation, validation.
     with st.sidebar:
         st.markdown(f'<div class="lg lg-cap">{df.shape[0]:,} rows, {df.shape[1]:,} columns.</div>', unsafe_allow_html=True)
         step(2, "Variables")
-        target = st.selectbox("Dependent variable (two values)", candidates, index=None,
-                              placeholder="Choose a column", key=key("target"))
-        positive = None
-        if target is not None:
-            levels = sorted(df[target].dropna().unique().tolist(), key=str)
-            default = levels.index(1) if 1 in levels else len(levels) - 1
-            positive = st.selectbox("Event coded as 1", levels, index=default, key=key("positive"), format_func=label_text)
+        target = st.selectbox("Dependent variable", candidates, index=None, placeholder="Choose a column",
+                              key=key("target"),
+                              help="Choose the column your theory explains. A column with more than two values is turned "
+                                   "into 0/1 by choosing which values, or which threshold, count as the event.")
+        event = choose_event(df, target, key) if target is not None else None
         options = feature_candidates(df, target) if target is not None else []
         features = st.multiselect("Independent variables", options, key=key("features"),
                                   placeholder="Choose one or more columns",
@@ -822,14 +868,14 @@ def main():
             c_value = st.number_input("Inverse penalty strength C", min_value=0.0001, value=c_value, step=0.1,
                                       format="%.4f", key=key("c"), help="Smaller values shrink the coefficients more.")
 
-    if target is None or not features:
-        show(section_html("Choose the variables", "Select the dependent variable and at least one independent variable in step 2."))
+    if target is None or event is None or not features:
+        show(section_html("Choose the variables", "In step 2, select the dependent variable, define the event and select at least one independent variable."))
         tab_data, = st.tabs(["Data and preparation"])
         with tab_data:
             data_overview(df)
         return
 
-    design = build_design(df, target, positive, features, missing_rule)
+    design = build_design(df, target, event, features, missing_rule)
     X, y, continuous = design["X"], design["y"], design["continuous"]
     if X.shape[1] == 0:
         st.error("None of the chosen independent variables can be used. " + " ".join(design["notes"]))
@@ -876,7 +922,7 @@ def main():
         data_overview(df, design, prep_full, Xp)
 
     with tab_home:
-        render_home(df, target, positive, design, prep_full, Xp, full, full_err, split, split_err,
+        render_home(df, target, event, design, prep_full, Xp, full, full_err, split, split_err,
                     robust, threshold, test_pct, seed, stratify, penalty, c_value, key)
 
 
@@ -906,11 +952,11 @@ def data_overview(df, design=None, prep=None, Xp=None):
     show(table_html(["Column", "Type", "Missing", "Distinct values"], column_overview(df)))
 
 
-def render_home(df, target, positive, design, prep_full, Xp, full, full_err, split, split_err,
+def render_home(df, target, event, design, prep_full, Xp, full, full_err, split, split_err,
                 robust, threshold, test_pct, seed, stratify, penalty, c_value, key):
     y = design["y"]
     transformed = [c for c, p in prep_full.plan.items() if p["method"] != "None"]
-    strip_chips([f"Dependent variable: {target}", f"Event (1): {label_text(positive)}", f"{len(y):,} observations",
+    strip_chips([f"Dependent variable: {target}", f"Event (1): {event_text(target, event)}", f"{len(y):,} observations",
                  f"{Xp.shape[1]} predictor" + ("" if Xp.shape[1] == 1 else "s"), "standardized" if prep_full.standardize else "not standardized",
                  (f"{len(transformed)} transformed" if transformed else "no transformation"), SE_LABELS[robust]])
     for note in design["notes"]:
@@ -1027,3 +1073,7 @@ if __name__ == "__main__":
 #   measures (accuracy, precision, recall, F1, AUC, log loss), confusion matrix, ROC chart, sigmoid
 #   chart (linear score or one variable), coefficient comparison with CSV download. Charts are drawn
 #   twice (wide and narrow) and CSS shows the one that fits the screen.
+# v1.1 (2026-10-09)  Changed: any column with at least two distinct values can be the dependent variable
+#   (dependent_candidates replaces target_candidates). Added: choose_event (a value, several values or a
+#   threshold defines the event), encode_event, event_text, EVENT_OPS, OP_SYMBOLS. Changed: build_design and
+#   render_home take an event instead of one positive value; the event shows in the status chips.
