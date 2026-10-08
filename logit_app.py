@@ -101,7 +101,14 @@ CSS = """
 box-shadow:0 0 0 1px var(--line);}
 [data-testid="stMain"],section.main{background:var(--paper) !important;}
 header[data-testid="stHeader"]{background:transparent !important;}
-[data-testid="stToolbar"],[data-testid="stDecoration"],#MainMenu,footer{display:none !important;}
+[data-testid="stToolbarActions"],[data-testid="stAppDeployButton"],.stAppDeployButton,[data-testid="stMainMenu"],#MainMenu,
+[data-testid="stDecoration"],footer{display:none !important;}
+[data-testid="stToolbar"]{background:transparent !important;}
+[data-testid="stExpandSidebarButton"],[data-testid="stSidebarCollapsedControl"] button{background:var(--panel) !important;
+border:1px solid var(--line) !important;border-radius:6px;color:var(--accent) !important;}
+[data-testid="stExpandSidebarButton"] *,[data-testid="stSidebarCollapsedControl"] button *{color:var(--accent) !important;}
+[data-testid="stSidebarCollapsedControl"]{left:max(18px,calc(50vw - __FRAME__px / 2 + 18px)) !important;}
+[data-testid="stAppViewContainer"]:has(section[data-testid="stSidebar"][aria-expanded="true"]) [data-testid="stSidebarCollapsedControl"]{display:none !important;}
 section[data-testid="stSidebar"]{width:__SIDEBAR__px !important;min-width:__SIDEBAR__px !important;
 max-width:100vw;background:var(--panel) !important;border-right:1px solid var(--line);}
 section[data-testid="stSidebar"][aria-expanded="false"]{display:none !important;}
@@ -1077,3 +1084,8 @@ if __name__ == "__main__":
 #   (dependent_candidates replaces target_candidates). Added: choose_event (a value, several values or a
 #   threshold defines the event), encode_event, event_text, EVENT_OPS, OP_SYMBOLS. Changed: build_design and
 #   render_home take an event instead of one positive value; the event shows in the status chips.
+# v1.2 (2026-10-09)  Fixed: after collapsing the left panel it could not be opened again, because the CSS hid
+#   Streamlit's whole toolbar, which holds the button that reopens it (stExpandSidebarButton in newer
+#   versions). Now only the deploy button, the menu and the decoration are hidden, and the reopen button
+#   is shown with a border and the accent colour. In Streamlit 1.40 the reopen control is placed inside the
+#   frame (left edge of the frame plus 18 px) and is hidden while the panel is open.
